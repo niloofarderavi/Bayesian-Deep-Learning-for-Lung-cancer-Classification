@@ -58,39 +58,54 @@ Model 2: ResNet50V2 + Adaptive SMOTE
 Model 3: Bayesian DenseNet + Ultra-severe sampling
 
 📊 Results
-Individual Model Performance
-ModelAccuracyAUCWeighted F1Bayesian DenseNet90.2%96.7%90.2%DenseNet + MEGA-SMOTE92.8%99.0%92.9%ResNet50V2 + Adaptive94.6%99.3%94.7%
-Ensemble Performance
 
-Overall Accuracy: 92.8%
-Weighted F1-Score: 92.9%
-AUC: 99.0%
+## Key Results
 
-Key Achievements
-✅ 90%+ Bayesian accuracy with uncertainty quantification
-✅ Clinical-grade performance across all lung pathology classes
-✅ Robust uncertainty measures for medical decision support
-✅ Successful handling of extreme class imbalance
+### Model Performance Summary
+
+| Model | Accuracy | Weighted F1 | AUC | Best Validation Score |
+|-------|----------|-------------|-----|-----------------------|
+| DenseNet121 + MEGA-SMOTE | 92.86% | 0.9288 | 0.9898 | 92.86% (val) |
+| ResNet50V2 + Adaptive-SMOTE | 94.64% | 0.9466 | 0.9926 | 94.64% (val) |
+| Bayesian DenseNet121 | 90.18% | 0.9018 | 0.9673 | 90.18% (val) |
+| **Ensemble** | **93.24%** | **0.9324** | **0.9915** | - |
 
 
-Key Technical Innovations
-Stable Bayesian Training
+### Training Highlights
 
-Controlled KL Divergence: Prevents gradient explosion
-Gradual Activation: Warmup period for stable convergence
-Medical-Calibrated Priors: Tailored for lung pathology discrimination
+- Achieved >90% accuracy on all models despite severe class imbalance
+- Bayesian model showed excellent calibration with 90.18% accuracy
+- ResNet50V2 with Adaptive-SMOTE performed best (94.64% accuracy)
+- Ensemble approach combined strengths of all models
 
+## Features
 
-Medical-Specific Design
+- **Handles Extreme Class Imbalance** with:
+  - MEGA-SMOTE and Adaptive-SMOTE sampling
+  - Power-scaled class weights (up to 2.34x for minority classes)
+  - Progressive training strategy (balanced → gradual → full)
 
-Uncertainty-Aware Predictions: Critical for clinical decision support
-Extreme Imbalance Solutions: Handles rare disease distributions
-Clinical Validation Metrics: Beyond standard ML evaluation
+- **STABLE Bayesian Neural Network** with:
+  - Proper KL divergence handling
+  - Gradual KL weight scheduling
+  - Uncertainty quantification (epistemic + aleatoric)
 
+- **Enhanced Model Architectures**:
+  - DenseNet121 and ResNet50V2 backbones
+  - Attention mechanisms
+  - Robust regularization (l1_l2, dropout 0.5)
 
-Clinical Impact
+- **Comprehensive Evaluation**:
+  - Test-time augmentation (8 augmentations per image)
+  - Ensemble predictions with weighted averaging
+  - Detailed performance visualization
 
-Diagnostic Confidence: Uncertainty measures guide radiologist attention
-Rare Disease Detection: Specialized techniques for minority pathologies
-Risk Stratification: Predictive confidence for treatment planning
-AI Transparency: Explainable uncertainty for clinical adoption
+## Dataset
+
+The project uses the [Chest CT-Scan Images Dataset](https://www.kaggle.com/datasets/mohamedhanyyy/chest-ctscan-images) from Kaggle, containing CT-scan images of lung conditions.
+
+**Final Class Distribution:**
+- Train: 472 samples ([87, 109, 137, 139] per class)
+- Val: 119 samples ([22, 27, 35, 35] per class)
+- Test: 148 samples ([27, 34, 43, 44] per class)
+
