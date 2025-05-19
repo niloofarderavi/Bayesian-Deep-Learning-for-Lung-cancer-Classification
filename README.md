@@ -1,7 +1,10 @@
 Bayesian Deep Learning for Lung cancer Classification
+
 A robust deep learning framework for classifying lung cancer from chest CT scans using Bayesian neural networks with uncertainty quantification, specifically designed for extremely imbalanced medical dataset.
+
 🏥 Overview
 This project implements a Bayesian deep learning system for lung cancer classification from chest CT scans, addressing the critical need for uncertainty quantification in medical AI. The system provides both diagnostic predictions and clinically-relevant confidence measures essential for radiologist trust and patient safety.
+
 📋 Features
 Core Capabilities
 
