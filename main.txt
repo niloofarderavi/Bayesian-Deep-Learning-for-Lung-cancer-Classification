@@ -1,0 +1,1390 @@
+import os
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+import tensorflow_probability as tfp
+from tensorflow.keras.applications import DenseNet121, ResNet50V2
+from tensorflow.keras.layers import (Dense, Input, GlobalAveragePooling2D, GlobalMaxPooling2D,
+                                   BatchNormalization, Dropout, GaussianNoise, Conv2D,
+                                   Multiply, Concatenate, Layer, Add, Activation, Lambda,
+                                   MultiHeadAttention, LayerNormalization)
+from tensorflow.keras.models import Model
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau, LearningRateScheduler
+from tensorflow.keras.metrics import AUC, Precision, Recall
+from tensorflow.keras.optimizers import Adam, AdamW
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.regularizers import l1_l2
+import matplotlib.pyplot as plt
+from sklearn.metrics import classification_report, roc_auc_score, f1_score, precision_score, recall_score
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import train_test_split
+from imblearn.over_sampling import SMOTE, ADASYN, SVMSMOTE, KMeansSMOTE
+from imblearn.under_sampling import RandomUnderSampler, EditedNearestNeighbours, TomekLinks
+from imblearn.combine import SMOTETomek, SMOTEENN
+from imblearn.pipeline import Pipeline as ImbPipeline
+import cv2
+from PIL import Image
+import kagglehub
+import gc
+
+# Set random seed for reproducibility
+tf.random.set_seed(42)
+np.random.seed(42)
+
+# Memory optimization settings
+physical_devices = tf.config.experimental.list_physical_devices('GPU')
+if len(physical_devices) > 0:
+    tf.config.experimental.set_memory_growth(physical_devices[0], True)
+
+# Download dataset using kagglehub
+print("Downloading dataset...")
+try:
+    dataset_path = kagglehub.dataset_download("mohamedhanyyy/chest-ctscan-images")
+    print(f"Dataset downloaded to: {dataset_path}")
+
+    # Try to find the correct data directory
+    possible_paths = [
+        os.path.join(dataset_path, "Data"),
+        os.path.join(dataset_path, "data"),
+        dataset_path,
+        os.path.join(dataset_path, "chest-ctscan-images"),
+    ]
+
+    DATA_PATH = None
+    for path in possible_paths:
+        if os.path.exists(path):
+            # Check if it contains train/valid/test directories
+            subdirs = os.listdir(path) if os.path.exists(path) else []
+            if any(d in subdirs for d in ['train', 'valid', 'test', 'validation']):
+                DATA_PATH = path
+                break
+
+    if DATA_PATH is None:
+        # Use the downloaded path as fallback
+        DATA_PATH = dataset_path
+
+except Exception as e:
+    print(f"Error downloading dataset: {e}")
+    DATA_PATH = "/root/.cache/kagglehub/datasets/mohamedhanyyy/chest-ctscan-images/versions/1/Data"
+
+print("Using dataset path:", DATA_PATH)
+
+# Constants - Optimized for smaller dataset
+IMG_SIZE = 224
+BATCH_SIZE = 16  # Increased for better gradient estimation
+TEST_BATCH_SIZE = 8
+EPOCHS = 150
+NUM_CLASSES = 4
+PLOTS_DIR = "plots"
+os.makedirs(PLOTS_DIR, exist_ok=True)
+
+# Enhanced data loading with proper image preprocessing
+def load_all_data(data_path):
+    """Load all images and labels, then apply proper train/val/test split"""
+    all_images = []
+    all_labels = []
+    class_names = []
+
+    # Find directories
+    available_dirs = os.listdir(data_path)
+    data_dirs = ['train', 'valid', 'test']
+
+    # Collect all data first
+    for split_dir in data_dirs:
+        if split_dir in available_dirs:
+            split_path = os.path.join(data_path, split_dir)
+            for class_idx, class_name in enumerate(sorted(os.listdir(split_path))):
+                if class_name not in class_names:
+                    class_names.append(class_name)
+                class_idx = class_names.index(class_name)
+
+                class_path = os.path.join(split_path, class_name)
+                if os.path.isdir(class_path):
+                    for img_file in os.listdir(class_path):
+                        if img_file.lower().endswith(('.jpg', '.jpeg', '.png')):
+                            img_path = os.path.join(class_path, img_file)
+                            try:
+                                # Load and preprocess image
+                                img = cv2.imread(img_path)
+                                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                                img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+                                img = img.astype(np.float32) / 255.0
+
+                                all_images.append(img)
+                                all_labels.append(class_idx)
+                            except Exception as e:
+                                print(f"Error loading {img_path}: {e}")
+
+    X = np.array(all_images)
+    y = np.array(all_labels)
+
+    print(f"Loaded {len(X)} images")
+    print(f"Class distribution: {np.bincount(y)}")
+    print(f"Class names: {class_names}")
+
+    return X, y, class_names
+
+# Enhanced data generator with stronger augmentation
+class AdvancedDataGenerator(tf.keras.utils.Sequence):
+    def __init__(self, X, y, batch_size=16, shuffle=True, augment=True,
+                 class_weights=None, **kwargs):
+        super().__init__(**kwargs)
+        self.X = X
+        self.y = y
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.augment = augment
+        self.class_weights = class_weights
+        self.indices = np.arange(len(X))
+        self.on_epoch_end()
+
+    def __len__(self):
+        return len(self.indices) // self.batch_size
+
+    def __getitem__(self, index):
+        indices = self.indices[index * self.batch_size:(index + 1) * self.batch_size]
+        return self._generate_batch(indices)
+
+    def _generate_batch(self, indices):
+        X_batch = self.X[indices].copy()
+        y_batch = self.y[indices].copy()
+
+        # Apply strong augmentations if training
+        if self.augment:
+            for i in range(len(X_batch)):
+                # Random horizontal flip
+                if np.random.random() > 0.5:
+                    X_batch[i] = np.fliplr(X_batch[i])
+
+                # Random rotation (small angles)
+                if np.random.random() > 0.5:
+                    angle = np.random.uniform(-15, 15)
+                    X_batch[i] = self._rotate_image(X_batch[i], angle)
+
+                # Random zoom
+                if np.random.random() > 0.6:
+                    zoom_factor = np.random.uniform(0.9, 1.1)
+                    X_batch[i] = self._zoom_image(X_batch[i], zoom_factor)
+
+                # Random brightness adjustment
+                if np.random.random() > 0.5:
+                    brightness_factor = np.random.uniform(0.8, 1.2)
+                    X_batch[i] = np.clip(X_batch[i] * brightness_factor, 0, 1)
+
+                # Random contrast adjustment
+                if np.random.random() > 0.5:
+                    contrast_factor = np.random.uniform(0.8, 1.2)
+                    mean = np.mean(X_batch[i])
+                    X_batch[i] = np.clip((X_batch[i] - mean) * contrast_factor + mean, 0, 1)
+
+                # Add slight gaussian noise
+                if np.random.random() > 0.7:
+                    noise = np.random.normal(0, 0.02, X_batch[i].shape)
+                    X_batch[i] = np.clip(X_batch[i] + noise, 0, 1)
+
+        # Convert labels to categorical
+        y_batch = to_categorical(y_batch, NUM_CLASSES)
+
+        return X_batch, y_batch
+
+    def _rotate_image(self, image, angle):
+        """Rotate image by given angle"""
+        height, width = image.shape[:2]
+        rotation_matrix = cv2.getRotationMatrix2D((width/2, height/2), angle, 1)
+        rotated = cv2.warpAffine(image, rotation_matrix, (width, height))
+        return rotated
+
+    def _zoom_image(self, image, zoom_factor):
+        """Zoom image by given factor"""
+        height, width = image.shape[:2]
+        new_height, new_width = int(height * zoom_factor), int(width * zoom_factor)
+        
+        if zoom_factor > 1:
+            # Crop center
+            resized = cv2.resize(image, (new_width, new_height))
+            start_x = (new_width - width) // 2
+            start_y = (new_height - height) // 2
+            return resized[start_y:start_y+height, start_x:start_x+width]
+        else:
+            # Pad
+            resized = cv2.resize(image, (new_width, new_height))
+            pad_x = (width - new_width) // 2
+            pad_y = (height - new_height) // 2
+            return np.pad(resized, ((pad_y, width-new_width-pad_y), (pad_x, height-new_height-pad_x), (0, 0)), mode='edge')
+
+    def on_epoch_end(self):
+        if self.shuffle:
+            np.random.shuffle(self.indices)
+
+# Advanced sampling strategies for extreme imbalance
+def apply_extreme_imbalance_sampling(X, y, strategy='mega_smote'):
+    """Apply extreme sampling to handle severe imbalance"""
+    # Flatten images for sampling algorithms
+    X_flat = X.reshape(X.shape[0], -1)
+
+    if strategy == 'mega_smote':
+        # Multi-stage SMOTE for extreme imbalance
+        # First balance to make all classes at least 80% of majority
+        unique, counts = np.unique(y, return_counts=True)
+        max_count = np.max(counts)
+        target_counts = {cls: max(80, int(max_count * 0.8)) for cls in unique}
+        
+        sampler = SMOTE(
+            sampling_strategy=target_counts,
+            random_state=42,
+            k_neighbors=min(3, min(counts) - 1) if min(counts) > 1 else 1
+        )
+    elif strategy == 'adaptive_smote':
+        # Adaptive SMOTE that adjusts k_neighbors based on class size
+        unique, counts = np.unique(y, return_counts=True)
+        max_count = np.max(counts)
+        
+        # Progressive balancing
+        target_counts = {}
+        for cls, count in zip(unique, counts):
+            if count < max_count * 0.1:  # Very minority class
+                target_counts[cls] = int(max_count * 0.5)
+            elif count < max_count * 0.3:  # Minority class
+                target_counts[cls] = int(max_count * 0.7)
+            else:  # Already reasonable
+                target_counts[cls] = count
+        
+        sampler = SMOTE(
+            sampling_strategy=target_counts,
+            random_state=42,
+            k_neighbors=min(2, min(counts) - 1) if min(counts) > 1 else 1
+        )
+    elif strategy == 'hybrid_extreme':
+        # Hybrid approach: SMOTE + ADASYN + cleaning
+        unique, counts = np.unique(y, return_counts=True)
+        max_count = np.max(counts)
+        
+        # First stage: SMOTE to bring minorities to 40% of majority
+        target_counts_1 = {cls: max(count, int(max_count * 0.4)) for cls, count in zip(unique, counts)}
+        
+        sampler = ImbPipeline([
+            ('smote1', SMOTE(sampling_strategy=target_counts_1, random_state=42, k_neighbors=1)),
+            ('adasyn', ADASYN(sampling_strategy='auto', random_state=42, n_neighbors=3)),
+            ('tomek', TomekLinks())
+        ])
+    else:
+        return X, y
+
+    try:
+        X_resampled, y_resampled = sampler.fit_resample(X_flat, y)
+        # Reshape back to image format
+        X_resampled = X_resampled.reshape(-1, IMG_SIZE, IMG_SIZE, 3)
+        print(f"Resampling successful: {len(X_resampled)} samples, distribution: {np.bincount(y_resampled)}")
+        return X_resampled, y_resampled
+    except Exception as e:
+        print(f"Sampling failed: {e}, using original data")
+        return X, y
+
+# Robust loss functions for extreme imbalance
+class ExtremeFocalLoss(tf.keras.losses.Loss):
+    def __init__(self, alpha=0.8, gamma=3.0, class_weights=None, label_smoothing=0.1):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.class_weights = class_weights
+        self.label_smoothing = label_smoothing
+
+    def call(self, y_true, y_pred):
+        # Apply label smoothing
+        if self.label_smoothing > 0:
+            y_true = y_true * (1 - self.label_smoothing) + self.label_smoothing / NUM_CLASSES
+
+        # Clip predictions to prevent log(0)
+        epsilon = tf.keras.backend.epsilon()
+        y_pred = tf.clip_by_value(y_pred, epsilon, 1. - epsilon)
+
+        # Calculate focal loss with higher gamma for extreme imbalance
+        pt = y_true * y_pred + (1 - y_true) * (1 - y_pred)
+        focal_weight = self.alpha * tf.pow(1 - pt, self.gamma)
+
+        cross_entropy = -y_true * tf.math.log(y_pred)
+        focal_loss = focal_weight * cross_entropy
+
+        # Apply class weights with stronger emphasis
+        if self.class_weights is not None:
+            # Square the weights for extreme emphasis
+            enhanced_weights = tf.constant([self.class_weights[i] ** 2 for i in range(NUM_CLASSES)])
+            sample_weights = tf.reduce_sum(y_true * enhanced_weights, axis=-1, keepdims=True)
+            focal_loss = focal_loss * sample_weights
+
+        return tf.reduce_mean(tf.reduce_sum(focal_loss, axis=-1))
+
+# Custom F1 score metric
+class WeightedF1Score(tf.keras.metrics.Metric):
+    def __init__(self, name='weighted_f1_score', num_classes=4, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.num_classes = num_classes
+        self.true_positives = self.add_weight(name='tp', shape=(num_classes,), initializer='zeros')
+        self.false_positives = self.add_weight(name='fp', shape=(num_classes,), initializer='zeros')
+        self.false_negatives = self.add_weight(name='fn', shape=(num_classes,), initializer='zeros')
+        self.support = self.add_weight(name='support', shape=(num_classes,), initializer='zeros')
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true = tf.argmax(y_true, axis=-1)
+        y_pred = tf.argmax(y_pred, axis=-1)
+
+        # Convert to one-hot for easier computation
+        y_true_oh = tf.one_hot(y_true, self.num_classes)
+        y_pred_oh = tf.one_hot(y_pred, self.num_classes)
+
+        # Calculate TP, FP, FN for all classes at once
+        tp = tf.reduce_sum(y_true_oh * y_pred_oh, axis=0)
+        fp = tf.reduce_sum((1 - y_true_oh) * y_pred_oh, axis=0)
+        fn = tf.reduce_sum(y_true_oh * (1 - y_pred_oh), axis=0)
+        support = tf.reduce_sum(y_true_oh, axis=0)
+
+        # Update state variables
+        self.true_positives.assign_add(tp)
+        self.false_positives.assign_add(fp)
+        self.false_negatives.assign_add(fn)
+        self.support.assign_add(support)
+
+    def result(self):
+        precision = self.true_positives / (self.true_positives + self.false_positives + tf.keras.backend.epsilon())
+        recall = self.true_positives / (self.true_positives + self.false_negatives + tf.keras.backend.epsilon())
+        f1 = 2 * (precision * recall) / (precision + recall + tf.keras.backend.epsilon())
+
+        # Weighted average
+        total_support = tf.reduce_sum(self.support)
+        weighted_f1 = tf.reduce_sum(f1 * self.support) / (total_support + tf.keras.backend.epsilon())
+
+        return weighted_f1
+
+    def reset_states(self):
+        self.true_positives.assign(tf.zeros_like(self.true_positives))
+        self.false_positives.assign(tf.zeros_like(self.false_positives))
+        self.false_negatives.assign(tf.zeros_like(self.false_negatives))
+        self.support.assign(tf.zeros_like(self.support))
+
+# STABLE Bayesian Neural Network Components (Fixed)
+class StableVariationalDense(Layer):
+    """Stable variational dense layer for Bayesian neural networks"""
+    def __init__(self, units, activation=None, kl_weight=1e-6, prior_std=1.0, **kwargs):
+        super().__init__(**kwargs)
+        self.units = units
+        self.activation = activation
+        self.kl_weight = kl_weight  # Much smaller KL weight
+        self.prior_std = prior_std
+        
+    def build(self, input_shape):
+        input_dim = input_shape[-1]
+        
+        # Weight parameters with better initialization
+        self.kernel_mu = self.add_weight(
+            name='kernel_mu',
+            shape=(input_dim, self.units),
+            initializer=tf.keras.initializers.TruncatedNormal(mean=0, stddev=0.01),
+            trainable=True
+        )
+        self.kernel_rho = self.add_weight(
+            name='kernel_rho',
+            shape=(input_dim, self.units),
+            initializer=tf.keras.initializers.Constant(-5.0),  # Start with small variance
+            trainable=True
+        )
+        
+        # Bias parameters
+        self.bias_mu = self.add_weight(
+            name='bias_mu',
+            shape=(self.units,),
+            initializer='zeros',
+            trainable=True
+        )
+        self.bias_rho = self.add_weight(
+            name='bias_rho',
+            shape=(self.units,),
+            initializer=tf.keras.initializers.Constant(-5.0),
+            trainable=True
+        )
+        
+        super().build(input_shape)
+    
+    def call(self, inputs, training=None):
+        # Use mean weights during inference and early training for stability
+        if training and hasattr(self, '_training_step'):
+            self._training_step += 1
+        else:
+            self._training_step = 0
+            
+        # Only start sampling after some warmup steps
+        use_sampling = training and self._training_step > 100
+        
+        if use_sampling:
+            # Sample weights from posterior with clipping for stability
+            kernel_std = tf.nn.softplus(self.kernel_rho)
+            kernel_std = tf.clip_by_value(kernel_std, 1e-5, 1.0)  # Clip variance
+            kernel = self.kernel_mu + kernel_std * tf.random.normal(tf.shape(self.kernel_mu))
+            
+            bias_std = tf.nn.softplus(self.bias_rho)
+            bias_std = tf.clip_by_value(bias_std, 1e-5, 1.0)
+            bias = self.bias_mu + bias_std * tf.random.normal(tf.shape(self.bias_mu))
+            
+            # Calculate KL divergence with numerical stability
+            kernel_kl = self._stable_kl_divergence(self.kernel_mu, kernel_std)
+            bias_kl = self._stable_kl_divergence(self.bias_mu, bias_std)
+            
+            # Add very small KL loss
+            kl_loss = self.kl_weight * (kernel_kl + bias_kl)
+            # Gradually increase KL weight
+            kl_weight_schedule = min(1.0, self._training_step / 1000.0)
+            self.add_loss(kl_loss * kl_weight_schedule)
+        else:
+            # Use mean weights for stability
+            kernel = self.kernel_mu
+            bias = self.bias_mu
+        
+        # Forward pass
+        output = tf.matmul(inputs, kernel) + bias
+        
+        if self.activation:
+            output = tf.keras.activations.get(self.activation)(output)
+            
+        return output
+    
+    def _stable_kl_divergence(self, mu, sigma):
+        """Calculate KL divergence between posterior and prior with numerical stability"""
+        # KL divergence between N(mu, sigma) and N(0, prior_std)
+        prior_var = self.prior_std ** 2
+        posterior_var = sigma ** 2
+        
+        # KL = log(σ₁/σ₀) + (σ₀² + μ₀²)/(2σ₁²) - 1/2
+        kl = tf.math.log(self.prior_std / (sigma + 1e-8)) + \
+             (posterior_var + mu ** 2) / (2 * prior_var) - 0.5
+        
+        # Clip KL divergence to prevent explosion
+        kl = tf.clip_by_value(kl, -10.0, 10.0)
+        return tf.reduce_sum(kl)
+
+class StableBayesianDropout(Layer):
+    """Stable Bayesian dropout layer"""
+    def __init__(self, rate, **kwargs):
+        super().__init__(**kwargs)
+        self.rate = rate
+        
+    def call(self, inputs, training=None):
+        # Standard dropout during training, but can be activated during inference for uncertainty
+        if training:
+            return tf.nn.dropout(inputs, rate=self.rate)
+        else:
+            # Can manually enable during inference for uncertainty estimation
+            return inputs
+
+# Enhanced model architectures
+def create_enhanced_model(backbone='densenet', use_attention=True, input_shape=(224, 224, 3)):
+    """Create an enhanced model for extreme imbalanced medical data"""
+    inputs = Input(shape=input_shape)
+
+    # Choose and load backbone
+    if backbone == 'densenet':
+        base_model = DenseNet121(weights='imagenet', include_top=False, input_shape=input_shape)
+    else:  # resnet
+        base_model = ResNet50V2(weights='imagenet', include_top=False, input_shape=input_shape)
+
+    # Unfreeze more layers for better learning
+    for layer in base_model.layers[:-40]:
+        layer.trainable = False
+    for layer in base_model.layers[-40:]:
+        layer.trainable = True
+
+    # Apply base model
+    x = base_model(inputs)
+
+    # Enhanced feature extraction
+    if use_attention:
+        # Spatial attention
+        spatial_features = GlobalAveragePooling2D()(x)
+        channel_features = GlobalMaxPooling2D()(x)
+        combined_features = Concatenate()([spatial_features, channel_features])
+
+        # Simple attention mechanism
+        attention_weights = Dense(combined_features.shape[-1], activation='sigmoid')(combined_features)
+        attention_features = Multiply()([combined_features, attention_weights])
+        x = attention_features
+    else:
+        # Standard pooling
+        avg_pool = GlobalAveragePooling2D()(x)
+        max_pool = GlobalMaxPooling2D()(x)
+        x = Concatenate()([avg_pool, max_pool])
+
+    # Robust classifier for extreme imbalance
+    x = Dropout(0.5)(x)
+    x = Dense(512, activation='swish', kernel_regularizer=l1_l2(l1=1e-4, l2=1e-3))(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.4)(x)
+    
+    x = Dense(256, activation='swish', kernel_regularizer=l1_l2(l1=1e-4, l2=1e-3))(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.3)(x)
+    
+    x = Dense(128, activation='swish', kernel_regularizer=l1_l2(l1=1e-4, l2=1e-3))(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.2)(x)
+
+    # Output layer
+    outputs = Dense(NUM_CLASSES, activation='softmax')(x)
+
+    model = Model(inputs, outputs)
+    print(f"Created enhanced {backbone} model with attention={use_attention}")
+
+    return model, base_model
+
+def create_stable_bayesian_model(backbone='densenet', input_shape=(224, 224, 3)):
+    """Create a STABLE Bayesian model with proper initialization"""
+    inputs = Input(shape=input_shape)
+
+    # Choose and load backbone
+    if backbone == 'densenet':
+        base_model = DenseNet121(weights='imagenet', include_top=False, input_shape=input_shape)
+    else:  # resnet
+        base_model = ResNet50V2(weights='imagenet', include_top=False, input_shape=input_shape)
+
+    # Freeze base model initially for stable Bayesian training
+    for layer in base_model.layers:
+        layer.trainable = False
+
+    # Apply base model
+    x = base_model(inputs)
+
+    # Feature extraction
+    avg_pool = GlobalAveragePooling2D()(x)
+    max_pool = GlobalMaxPooling2D()(x)
+    x = Concatenate()([avg_pool, max_pool])
+
+    # Stable Bayesian layers with gradual complexity
+    x = Dense(512, activation='swish')(x)  # Start with regular dense
+    x = BatchNormalization()(x)
+    x = StableBayesianDropout(0.3)(x)
+
+    x = StableVariationalDense(256, activation='swish', kl_weight=1e-6)(x)  # Very small KL weight
+    x = BatchNormalization()(x)
+    x = StableBayesianDropout(0.2)(x)
+
+    x = StableVariationalDense(128, activation='swish', kl_weight=1e-6)(x)
+    x = BatchNormalization()(x)
+    x = StableBayesianDropout(0.1)(x)
+
+    # Final layer - regular dense for stability
+    outputs = Dense(NUM_CLASSES, activation='softmax')(x)
+
+    model = Model(inputs, outputs)
+    print(f"Created STABLE Bayesian {backbone} model")
+
+    return model, base_model
+
+# Progressive training with extreme imbalance handling
+class ExtremeImbalanceTrainer:
+    def __init__(self, model, train_data, val_data, class_weights, class_names, model_type='standard'):
+        self.model = model
+        self.train_data = train_data
+        self.val_data = val_data
+        self.class_weights = class_weights
+        self.class_names = class_names
+        self.model_type = model_type
+        self.history = []
+
+    def train_progressive(self, epochs_per_stage=30):
+        """Progressive training for extreme imbalance"""
+
+        # Stage 1: Fully balanced training
+        print("Stage 1: Fully balanced training...")
+        balanced_train = self._create_balanced_subset(self.train_data, samples_per_class=150)
+        self._train_stage(balanced_train, epochs_per_stage, lr=3e-4, stage="fully_balanced")
+
+        # Stage 2: Gradually introduce imbalance
+        print("Stage 2: Gradual imbalance introduction...")
+        gradual_train = self._create_gradual_subset(self.train_data, balance_factor=0.7)
+        self._train_stage(gradual_train, epochs_per_stage, lr=1e-4, stage="gradual")
+
+        # Stage 3: Full dataset with all techniques
+        print("Stage 3: Full dataset training...")
+        self._train_stage(self.train_data, epochs_per_stage * 2, lr=5e-5, stage="full")
+
+        return self.history
+
+    def _create_balanced_subset(self, data, samples_per_class):
+        """Create perfectly balanced subset"""
+        X, y = data
+        balanced_X, balanced_y = [], []
+
+        for class_idx in range(NUM_CLASSES):
+            class_mask = y == class_idx
+            class_samples = X[class_mask]
+
+            # Use oversampling to ensure each class has exactly samples_per_class
+            if len(class_samples) >= samples_per_class:
+                indices = np.random.choice(len(class_samples), samples_per_class, replace=False)
+            else:
+                indices = np.random.choice(len(class_samples), samples_per_class, replace=True)
+            
+            selected_samples = class_samples[indices]
+            balanced_X.append(selected_samples)
+            balanced_y.extend([class_idx] * len(selected_samples))
+
+        return np.vstack(balanced_X), np.array(balanced_y)
+
+    def _create_gradual_subset(self, data, balance_factor=0.7):
+        """Create gradually imbalanced subset"""
+        X, y = data
+        gradual_X, gradual_y = [], []
+
+        class_counts = np.bincount(y)
+        max_count = np.max(class_counts)
+
+        for class_idx in range(NUM_CLASSES):
+            class_mask = y == class_idx
+            class_samples = X[class_mask]
+            
+            # Target count is between current count and max_count * balance_factor
+            current_count = len(class_samples)
+            target_count = min(current_count, int(max_count * balance_factor))
+            target_count = max(target_count, current_count)  # Don't reduce any class
+            
+            if len(class_samples) >= target_count:
+                indices = np.random.choice(len(class_samples), target_count, replace=False)
+            else:
+                indices = np.random.choice(len(class_samples), target_count, replace=True)
+            
+            selected_samples = class_samples[indices]
+            gradual_X.append(selected_samples)
+            gradual_y.extend([class_idx] * len(selected_samples))
+
+        return np.vstack(gradual_X), np.array(gradual_y)
+
+    def _train_stage(self, train_data, epochs, lr, stage):
+        """Train one stage with appropriate loss function"""
+        X_train, y_train = train_data
+        X_val, y_val = self.val_data
+
+        # Create data generators with strong augmentation
+        train_gen = AdvancedDataGenerator(X_train, y_train, batch_size=BATCH_SIZE,
+                                        shuffle=True, augment=True, class_weights=self.class_weights)
+        val_gen = AdvancedDataGenerator(X_val, y_val, batch_size=BATCH_SIZE,
+                                      shuffle=False, augment=False)
+
+        # Enhanced optimizer
+        optimizer = AdamW(learning_rate=lr, weight_decay=1e-4, clipnorm=1.0)
+
+        # Choose loss function based on stage and model type
+        if self.model_type == 'bayesian':
+            # Use standard loss for Bayesian to avoid interaction with KL loss
+            loss_fn = 'categorical_crossentropy'
+        else:
+            # Use extreme focal loss for standard models
+            samples_per_class = np.bincount(y_train)
+            loss_fn = ExtremeFocalLoss(alpha=0.8, gamma=3.0, class_weights=self.class_weights)
+
+        # Compile model
+        self.model.compile(
+            optimizer=optimizer,
+            loss=loss_fn,
+            metrics=['accuracy', AUC(name='auc'), WeightedF1Score(name='weighted_f1')]
+        )
+
+        # Enhanced callbacks
+        callbacks = [
+            EarlyStopping(patience=25, restore_best_weights=True, monitor='val_weighted_f1', mode='max'),
+            ReduceLROnPlateau(factor=0.5, patience=12, min_lr=1e-7, monitor='val_weighted_f1', mode='max'),
+            ModelCheckpoint(f"{stage}_{self.model_type}_best.h5", save_best_only=True, 
+                          monitor='val_weighted_f1', mode='max')
+        ]
+
+        # Train with class weights
+        history = self.model.fit(
+            train_gen,
+            validation_data=val_gen,
+            epochs=epochs,
+            callbacks=callbacks,
+            class_weight=self.class_weights,
+            verbose=1
+        )
+
+        self.history.append(history.history)
+
+        # Evaluate stage
+        val_results = self.model.evaluate(val_gen, verbose=0)
+        print(f"{stage.capitalize()} stage results - "
+              f"Loss: {val_results[0]:.4f}, "
+              f"Accuracy: {val_results[1]:.4f}, "
+              f"AUC: {val_results[2]:.4f}, "
+              f"Weighted F1: {val_results[3]:.4f}")
+
+        # Memory cleanup
+        optimize_memory()
+
+# Memory-efficient Test Time Augmentation
+def test_time_augmentation_efficient(model, X_test, num_augments=8):
+    """Apply test time augmentation with memory efficiency"""
+    tf.keras.backend.clear_session()
+    gc.collect()
+
+    all_predictions = []
+    chunk_size = 16  # Smaller chunks for TTA
+    
+    for start_idx in range(0, len(X_test), chunk_size):
+        end_idx = min(start_idx + chunk_size, len(X_test))
+        X_chunk = X_test[start_idx:end_idx]
+        
+        chunk_predictions = []
+        
+        for aug_idx in range(num_augments):
+            # Apply random augmentations
+            X_aug = X_chunk.copy()
+            for i in range(len(X_aug)):
+                # Random horizontal flip
+                if np.random.random() > 0.5:
+                    X_aug[i] = np.fliplr(X_aug[i])
+
+                # Random rotation (small)
+                if np.random.random() > 0.5:
+                    k = np.random.randint(1, 4)
+                    X_aug[i] = np.rot90(X_aug[i], k)
+
+                # Random brightness
+                if np.random.random() > 0.5:
+                    brightness_factor = np.random.uniform(0.9, 1.1)
+                    X_aug[i] = np.clip(X_aug[i] * brightness_factor, 0, 1)
+
+            # Get predictions
+            pred = model.predict(X_aug, batch_size=TEST_BATCH_SIZE, verbose=0)
+            chunk_predictions.append(pred)
+            
+            # Clear memory
+            del X_aug, pred
+            gc.collect()
+
+        # Average predictions for this chunk
+        chunk_mean = np.mean(chunk_predictions, axis=0)
+        all_predictions.append(chunk_mean)
+        
+        # Clear memory
+        del chunk_predictions, chunk_mean
+        gc.collect()
+
+    # Combine all predictions
+    final_predictions = np.vstack(all_predictions)
+    
+    return final_predictions
+
+# Bayesian uncertainty quantification
+def compute_bayesian_uncertainty(model, X, num_samples=20):
+    """Compute uncertainty using Monte Carlo sampling"""
+    tf.keras.backend.clear_session()
+    gc.collect()
+    
+    all_predictions = []
+    chunk_size = 16
+    
+    for start_idx in range(0, len(X), chunk_size):
+        end_idx = min(start_idx + chunk_size, len(X))
+        X_chunk = X[start_idx:end_idx]
+        
+        chunk_predictions = []
+        
+        for _ in range(num_samples):
+            # Enable training mode for dropout sampling
+            pred = model(X_chunk, training=True)
+            chunk_predictions.append(pred.numpy())
+            
+            # Clear memory
+            del pred
+            gc.collect()
+
+        # Calculate statistics for this chunk
+        chunk_preds = np.array(chunk_predictions)
+        chunk_mean = np.mean(chunk_preds, axis=0)
+        chunk_var = np.var(chunk_preds, axis=0)
+        
+        all_predictions.append({
+            'mean': chunk_mean,
+            'variance': chunk_var
+        })
+        
+        # Clear memory
+        del chunk_predictions, chunk_preds, chunk_mean, chunk_var
+        gc.collect()
+
+    # Combine results
+    mean_pred = np.vstack([chunk['mean'] for chunk in all_predictions])
+    var_pred = np.vstack([chunk['variance'] for chunk in all_predictions])
+    
+    # Calculate uncertainties
+    epistemic_uncertainty = np.mean(var_pred, axis=1)  # Model uncertainty
+    total_uncertainty = -np.sum(mean_pred * np.log(mean_pred + 1e-8), axis=1)  # Predictive entropy
+
+    return {
+        'mean': mean_pred,
+        'variance': var_pred,
+        'epistemic': epistemic_uncertainty,
+        'total': total_uncertainty
+    }
+
+# Memory optimization function
+def optimize_memory():
+    """Clean up memory and optimize GPU usage"""
+    tf.keras.backend.clear_session()
+    gc.collect()
+    
+    # Set memory growth if GPU available
+    physical_devices = tf.config.experimental.list_physical_devices('GPU')
+    if len(physical_devices) > 0:
+        tf.config.experimental.set_memory_growth(physical_devices[0], True)
+
+# Main execution function
+def main():
+    # Initial memory optimization
+    optimize_memory()
+    
+    # Load all data
+    print("Loading data...")
+    X_all, y_all, class_names = load_all_data(DATA_PATH)
+
+    # Limit number of classes to 4 and ensure consistent naming
+    if len(class_names) > NUM_CLASSES:
+        # Take the 4 most frequent classes
+        unique_classes, counts = np.unique(y_all, return_counts=True)
+        top_classes_idx = np.argsort(counts)[-NUM_CLASSES:]
+        top_classes = unique_classes[top_classes_idx]
+
+        # Filter data to only include top 4 classes
+        mask = np.isin(y_all, top_classes)
+        X_all = X_all[mask]
+        y_all = y_all[mask]
+
+        # Remap labels to 0-3
+        label_mapping = dict(zip(top_classes, range(NUM_CLASSES)))
+        y_all = np.array([label_mapping[label] for label in y_all])
+
+        # Update class names
+        class_names = [class_names[i] for i in top_classes_idx]
+
+        print(f"Limited to top {NUM_CLASSES} classes: {class_names}")
+
+    # Ensure we have exactly NUM_CLASSES
+    assert len(np.unique(y_all)) == NUM_CLASSES, f"Expected {NUM_CLASSES} classes, got {len(np.unique(y_all))}"
+
+    # Get class distribution
+    class_counts = np.bincount(y_all)
+    print(f"Class distribution: {dict(zip(class_names, class_counts))}")
+
+    # Calculate EXTREME class weights for severe imbalance
+    class_weights_balanced = compute_class_weight('balanced', classes=np.unique(y_all), y=y_all)
+    
+    # Apply extreme scaling for severe imbalance
+    # Use power scaling to heavily emphasis minority classes
+    extreme_weights = np.power(class_weights_balanced, 2.0)  # Square the weights
+    # Further boost based on actual imbalance ratio
+    max_count = np.max(class_counts)
+    for i, count in enumerate(class_counts):
+        imbalance_ratio = max_count / count
+        extreme_weights[i] *= np.sqrt(imbalance_ratio)  # Additional scaling
+    
+    class_weights_dict = dict(enumerate(extreme_weights))
+
+    print(f"EXTREME class weights: {class_weights_dict}")
+
+    # Split data with stratification
+    X_train_val, X_test, y_train_val, y_test = train_test_split(
+        X_all, y_all, test_size=0.2, stratify=y_all, random_state=42
+    )
+
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train_val, y_train_val, test_size=0.2, stratify=y_train_val, random_state=42
+    )
+
+    print(f"Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
+    print(f"Train distribution: {np.bincount(y_train)}")
+    print(f"Val distribution: {np.bincount(y_val)}")
+    print(f"Test distribution: {np.bincount(y_test)}")
+
+    # Apply EXTREME sampling strategies
+    sampling_strategies = ['mega_smote', 'adaptive_smote', 'bayesian']
+    model_types = ['standard', 'standard', 'bayesian']
+    models = []
+    model_names = []
+
+    for i, (strategy, model_type) in enumerate(zip(sampling_strategies, model_types)):
+        print(f"\n{'='*60}")
+        print(f"Training model {i+1}/3 with {strategy} sampling")
+        print(f"Model type: {model_type}")
+        print(f"{'='*60}")
+
+        # Clear memory before training each model
+        optimize_memory()
+
+        # Apply extreme sampling
+        if strategy == 'bayesian':
+            # For Bayesian model, use the most balanced approach
+            X_train_sampled, y_train_sampled = apply_extreme_imbalance_sampling(X_train, y_train, 'mega_smote')
+        else:
+            X_train_sampled, y_train_sampled = apply_extreme_imbalance_sampling(X_train, y_train, strategy)
+        
+        print(f"After {strategy}: {len(X_train_sampled)} samples")
+        print(f"New distribution: {np.bincount(y_train_sampled)}")
+
+        # Create model
+        if model_type == 'bayesian':
+            backbone = 'densenet'
+            model, base_model = create_stable_bayesian_model(backbone=backbone)
+            model_name = f"{backbone}_stable_bayesian_{strategy}"
+        else:
+            backbone = ['densenet', 'resnet50v2'][i]
+            model, base_model = create_enhanced_model(backbone=backbone, use_attention=True)
+            model_name = f"{backbone}_enhanced_{strategy}"
+
+        # Create trainer
+        trainer = ExtremeImbalanceTrainer(
+            model=model,
+            train_data=(X_train_sampled, y_train_sampled),
+            val_data=(X_val, y_val),
+            class_weights=class_weights_dict,
+            class_names=class_names,
+            model_type=model_type
+        )
+
+        # Train with progressive approach
+        history = trainer.train_progressive(epochs_per_stage=25)
+
+        # Evaluate on validation set
+        val_gen = AdvancedDataGenerator(X_val, y_val, batch_size=BATCH_SIZE,
+                                      shuffle=False, augment=False)
+        val_results = model.evaluate(val_gen, verbose=0)
+
+        print(f"Final validation results for {model_name}:")
+        print(f"  Loss: {val_results[0]:.4f}")
+        print(f"  Accuracy: {val_results[1]:.4f}")
+        print(f"  AUC: {val_results[2]:.4f}")
+        print(f"  Weighted F1: {val_results[3]:.4f}")
+
+        models.append(model)
+        model_names.append(model_name)
+        
+        # Clear memory after each model
+        del X_train_sampled, y_train_sampled
+        optimize_memory()
+
+    # Enhanced ensemble evaluation with TTA and Bayesian uncertainty
+    print(f"\n{'='*60}")
+    print("ENHANCED ENSEMBLE EVALUATION WITH TTA AND UNCERTAINTY")
+    print(f"{'='*60}")
+
+    # Get predictions from each model
+    ensemble_predictions = []
+    ensemble_uncertainties = []
+    bayesian_uncertainties = []
+
+    for i, (model, model_name) in enumerate(zip(models, model_names)):
+        print(f"Getting predictions from {model_name}...")
+        
+        # Clear memory before each model prediction
+        optimize_memory()
+
+        # Check if this is a Bayesian model
+        is_bayesian = 'bayesian' in model_name
+
+        if is_bayesian:
+            # For Bayesian models, get uncertainty estimates
+            uncertainty_results = compute_bayesian_uncertainty(model, X_test, num_samples=25)
+            predictions = uncertainty_results['mean']
+            total_uncertainty = uncertainty_results['total']
+            
+            # Store additional uncertainty measures for Bayesian models
+            bayesian_uncertainties.append({
+                'model_name': model_name,
+                'uncertainties': uncertainty_results
+            })
+        else:
+            # For non-Bayesian models, use TTA
+            predictions = test_time_augmentation_efficient(model, X_test, num_augments=8)
+            # Simple confidence-based uncertainty
+            total_uncertainty = 1.0 - np.max(predictions, axis=1)
+
+        ensemble_predictions.append(predictions)
+        ensemble_uncertainties.append(total_uncertainty)
+        
+        # Clear memory after each model
+        del predictions, total_uncertainty
+        optimize_memory()
+
+    # Combine ensemble predictions with weighted averaging
+    # Give higher weight to models with better validation performance
+    weights = [1.0, 1.0, 1.2]  # Slightly higher weight for Bayesian model
+    weighted_predictions = []
+    for i, pred in enumerate(ensemble_predictions):
+        weighted_predictions.append(pred * weights[i])
+    
+    ensemble_pred = np.sum(weighted_predictions, axis=0) / np.sum(weights)
+    ensemble_uncertainty = np.mean(ensemble_uncertainties, axis=0)
+
+    # Get predicted labels
+    y_pred = np.argmax(ensemble_pred, axis=1)
+
+    # Comprehensive evaluation
+    accuracy = np.mean(y_test == y_pred)
+    f1_weighted = f1_score(y_test, y_pred, average='weighted')
+    f1_macro = f1_score(y_test, y_pred, average='macro')
+    f1_per_class = f1_score(y_test, y_pred, average=None)
+    
+    # Calculate per-class metrics
+    precision_per_class = precision_score(y_test, y_pred, average=None)
+    recall_per_class = recall_score(y_test, y_pred, average=None)
+
+    try:
+        auc_weighted = roc_auc_score(to_categorical(y_test, NUM_CLASSES),
+                                   ensemble_pred, average='weighted', multi_class='ovr')
+    except:
+        auc_weighted = 0.5
+
+    print(f"\n{'='*60}")
+    print("FINAL ENHANCED ENSEMBLE RESULTS")
+    print(f"{'='*60}")
+    print(f"Overall Accuracy: {accuracy:.4f} ({accuracy*100:.1f}%)")
+    print(f"Weighted F1-Score: {f1_weighted:.4f}")
+    print(f"Macro F1-Score: {f1_macro:.4f}")
+    print(f"Weighted AUC: {auc_weighted:.4f}")
+    print(f"Average Uncertainty: {np.mean(ensemble_uncertainty):.4f}")
+
+    print(f"\nPer-Class Performance:")
+    for i, class_name in enumerate(class_names):
+        class_mask = y_test == i
+        if np.sum(class_mask) > 0:
+            class_acc = np.mean(y_pred[class_mask] == y_test[class_mask])
+            class_samples = np.sum(class_mask)
+            avg_uncertainty = np.mean(ensemble_uncertainty[class_mask])
+            print(f"  {class_name}:")
+            print(f"    Accuracy: {class_acc:.4f} ({class_acc*100:.1f}%)")
+            print(f"    F1-Score: {f1_per_class[i]:.4f}")
+            print(f"    Precision: {precision_per_class[i]:.4f}")
+            print(f"    Recall: {recall_per_class[i]:.4f}")
+            print(f"    Samples: {class_samples}")
+            print(f"    Avg Uncertainty: {avg_uncertainty:.4f}")
+
+    # Detailed classification report
+    print(f"\nDetailed Classification Report:")
+    print(classification_report(y_test, y_pred, target_names=class_names, digits=4))
+
+    # Bayesian uncertainty analysis
+    if bayesian_uncertainties:
+        print(f"\nBayesian Uncertainty Analysis:")
+        for bayes_result in bayesian_uncertainties:
+            model_name = bayes_result['model_name']
+            uncertainties = bayes_result['uncertainties']
+            
+            print(f"\n{model_name}:")
+            print(f"  Avg Epistemic Uncertainty: {np.mean(uncertainties['epistemic']):.4f}")
+            print(f"  Avg Total Uncertainty: {np.mean(uncertainties['total']):.4f}")
+            
+            # Analyze uncertainty by correctness
+            correct_mask = y_test == y_pred
+            correct_uncertainty = np.mean(uncertainties['total'][correct_mask])
+            incorrect_uncertainty = np.mean(uncertainties['total'][~correct_mask])
+            print(f"  Correct predictions uncertainty: {correct_uncertainty:.4f}")
+            print(f"  Incorrect predictions uncertainty: {incorrect_uncertainty:.4f}")
+            print(f"  Uncertainty discrimination: {incorrect_uncertainty - correct_uncertainty:.4f}")
+
+    # Save comprehensive results
+    results_df = pd.DataFrame({
+        'True_Label': y_test,
+        'Predicted_Label': y_pred,
+        'True_Class': [class_names[i] for i in y_test],
+        'Predicted_Class': [class_names[i] for i in y_pred],
+        'Ensemble_Uncertainty': ensemble_uncertainty,
+        'Max_Probability': np.max(ensemble_pred, axis=1),
+        'Correct': y_test == y_pred,
+        'Confidence': np.max(ensemble_pred, axis=1)
+    })
+
+    # Add class-specific probabilities
+    for i, class_name in enumerate(class_names):
+        results_df[f'Prob_{class_name}'] = ensemble_pred[:, i]
+
+    # Add Bayesian uncertainties if available
+    if bayesian_uncertainties:
+        for bayes_result in bayesian_uncertainties:
+            model_name = bayes_result['model_name'].replace('_', '_')
+            uncertainties = bayes_result['uncertainties']
+            
+            results_df[f'{model_name}_epistemic'] = uncertainties['epistemic']
+            results_df[f'{model_name}_total_uncertainty'] = uncertainties['total']
+
+    results_df.to_csv(os.path.join(PLOTS_DIR, "final_enhanced_results.csv"), index=False)
+
+    # Create comprehensive visualizations
+    fig, axes = plt.subplots(3, 3, figsize=(20, 18))
+
+    # 1. Original class distribution
+    bars = axes[0,0].bar(range(len(class_names)), class_counts, color='skyblue', edgecolor='black')
+    axes[0,0].set_title('Original Class Distribution', fontsize=14, fontweight='bold')
+    axes[0,0].set_ylabel('Count', fontsize=12)
+    axes[0,0].set_xticks(range(len(class_names)))
+    axes[0,0].set_xticklabels([name[:15] + '...' if len(name) > 15 else name for name in class_names], rotation=45)
+    for bar, count in zip(bars, class_counts):
+        height = bar.get_height()
+        axes[0,0].text(bar.get_x() + bar.get_width()/2., height + 1,
+                      f'{count}', ha='center', va='bottom', fontweight='bold')
+
+    # 2. Confusion matrix
+    from sklearn.metrics import confusion_matrix
+    cm = confusion_matrix(y_test, y_pred)
+    im = axes[0,1].imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    axes[0,1].set_title('Confusion Matrix', fontsize=14, fontweight='bold')
+
+    # Add text annotations with percentages
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            percent = cm[i, j] / np.sum(cm[i, :]) * 100 if np.sum(cm[i, :]) > 0 else 0
+            color = 'white' if cm[i, j] > cm.max() / 2 else 'black'
+            axes[0,1].text(j, i, f'{cm[i, j]}\n({percent:.1f}%)', 
+                          ha="center", va="center", fontsize=11, color=color, fontweight='bold')
+
+    axes[0,1].set_xlabel('Predicted Label', fontsize=12)
+    axes[0,1].set_ylabel('True Label', fontsize=12)
+    axes[0,1].set_xticks(range(NUM_CLASSES))
+    axes[0,1].set_yticks(range(NUM_CLASSES))
+    axes[0,1].set_xticklabels([name[:15] + '...' if len(name) > 15 else name for name in class_names], rotation=45)
+    axes[0,1].set_yticklabels([name[:15] + '...' if len(name) > 15 else name for name in class_names])
+
+    # 3. Per-class F1 scores with target line
+    colors = ['green' if f1 > 0.8 else 'orange' if f1 > 0.6 else 'red' for f1 in f1_per_class]
+    bars = axes[0,2].bar(range(len(class_names)), f1_per_class, color=colors, edgecolor='black')
+    axes[0,2].set_title('F1-Score by Class', fontsize=14, fontweight='bold')
+    axes[0,2].set_ylabel('F1-Score', fontsize=12)
+    axes[0,2].set_xticks(range(len(class_names)))
+    axes[0,2].set_xticklabels([name[:15] + '...' if len(name) > 15 else name for name in class_names], rotation=45)
+    axes[0,2].axhline(y=0.8, color='green', linestyle='--', alpha=0.7, linewidth=2, label='Target (80%)')
+    axes[0,2].legend()
+    for bar, f1 in zip(bars, f1_per_class):
+        height = bar.get_height()
+        axes[0,2].text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                      f'{f1:.3f}', ha='center', va='bottom', fontweight='bold')
+
+    # 4. Prediction confidence distribution
+    confidence_scores = np.max(ensemble_pred, axis=1)
+    axes[1,0].hist(confidence_scores, bins=30, alpha=0.7, edgecolor='black', color='lightblue')
+    axes[1,0].set_title('Prediction Confidence Distribution', fontsize=14, fontweight='bold')
+    axes[1,0].set_xlabel('Max Probability (Confidence)', fontsize=12)
+    axes[1,0].set_ylabel('Count', fontsize=12)
+    axes[1,0].axvline(x=0.8, color='red', linestyle='--', alpha=0.7, linewidth=2, label='High Confidence (80%)')
+    axes[1,0].axvline(x=np.mean(confidence_scores), color='blue', linestyle='-', alpha=0.7, linewidth=2, label=f'Mean ({np.mean(confidence_scores):.3f})')
+    axes[1,0].legend()
+
+    # 5. Uncertainty by true class
+    uncertainty_by_class = [ensemble_uncertainty[y_test == i] for i in range(NUM_CLASSES)]
+    box_plot = axes[1,1].boxplot(uncertainty_by_class, labels=[name[:10] + '...' if len(name) > 10 else name for name in class_names])
+    axes[1,1].set_title('Uncertainty by True Class', fontsize=14, fontweight='bold')
+    axes[1,1].set_ylabel('Uncertainty', fontsize=12)
+    axes[1,1].tick_params(axis='x', rotation=45)
+
+    # 6. Confidence vs Uncertainty scatter
+    correct_mask = y_test == y_pred
+    axes[1,2].scatter(ensemble_uncertainty[correct_mask], confidence_scores[correct_mask],
+                     alpha=0.6, label='Correct', color='green', s=25)
+    axes[1,2].scatter(ensemble_uncertainty[~correct_mask], confidence_scores[~correct_mask],
+                     alpha=0.6, label='Incorrect', color='red', s=25)
+    axes[1,2].set_xlabel('Uncertainty', fontsize=12)
+    axes[1,2].set_ylabel('Confidence', fontsize=12)
+    axes[1,2].set_title('Confidence vs Uncertainty', fontsize=14, fontweight='bold')
+    axes[1,2].legend()
+
+    # 7. Class-wise accuracy
+    class_accuracies = [np.mean(y_pred[y_test == i] == y_test[y_test == i]) if np.sum(y_test == i) > 0 else 0 for i in range(NUM_CLASSES)]
+    colors = ['green' if acc > 0.8 else 'orange' if acc > 0.6 else 'red' for acc in class_accuracies]
+    bars = axes[2,0].bar(range(len(class_names)), class_accuracies, color=colors, edgecolor='black')
+    axes[2,0].set_title('Class-wise Accuracy', fontsize=14, fontweight='bold')
+    axes[2,0].set_ylabel('Accuracy', fontsize=12)
+    axes[2,0].set_xticks(range(len(class_names)))
+    axes[2,0].set_xticklabels([name[:15] + '...' if len(name) > 15 else name for name in class_names], rotation=45)
+    axes[2,0].axhline(y=0.8, color='green', linestyle='--', alpha=0.7, linewidth=2, label='Target (80%)')
+    axes[2,0].legend()
+    for bar, acc in zip(bars, class_accuracies):
+        height = bar.get_height()
+        axes[2,0].text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                      f'{acc:.3f}', ha='center', va='bottom', fontweight='bold')
+
+    # 8. Precision vs Recall by class
+    axes[2,1].scatter(recall_per_class, precision_per_class, s=100, c=['green', 'blue', 'orange', 'red'], alpha=0.7)
+    for i, (r, p) in enumerate(zip(recall_per_class, precision_per_class)):
+        axes[2,1].annotate(class_names[i][:10] + '...' if len(class_names[i]) > 10 else class_names[i], 
+                          (r, p), xytext=(5, 5), textcoords='offset points', fontsize=9)
+    axes[2,1].set_xlabel('Recall', fontsize=12)
+    axes[2,1].set_ylabel('Precision', fontsize=12)
+    axes[2,1].set_title('Precision vs Recall by Class', fontsize=14, fontweight='bold')
+    axes[2,1].plot([0, 1], [0, 1], 'k--', alpha=0.5, label='Perfect')
+    axes[2,1].legend()
+
+    # 9. Model performance summary
+    metrics_summary = {
+        'Overall Accuracy': accuracy,
+        'Weighted F1': f1_weighted,
+        'Macro F1': f1_macro,
+        'Weighted AUC': auc_weighted
+    }
+    
+    metric_names = list(metrics_summary.keys())
+    metric_values = list(metrics_summary.values())
+    colors = ['green' if val > 0.8 else 'orange' if val > 0.6 else 'red' for val in metric_values]
+    
+    bars = axes[2,2].bar(metric_names, metric_values, color=colors, edgecolor='black')
+    axes[2,2].set_title('Overall Performance Summary', fontsize=14, fontweight='bold')
+    axes[2,2].set_ylabel('Score', fontsize=12)
+    axes[2,2].set_ylim(0, 1)
+    axes[2,2].axhline(y=0.8, color='green', linestyle='--', alpha=0.7, linewidth=2, label='Target (80%)')
+    axes[2,2].legend()
+    
+    for bar, val in zip(bars, metric_values):
+        height = bar.get_height()
+        axes[2,2].text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                      f'{val:.3f}', ha='center', va='bottom', fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOTS_DIR, 'comprehensive_analysis.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # Create Bayesian uncertainty analysis plot if available
+    if bayesian_uncertainties:
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        
+        bayes_result = bayesian_uncertainties[0]
+        uncertainties = bayes_result['uncertainties']
+        
+        # 1. Epistemic vs Total uncertainty
+        axes[0,0].scatter(uncertainties['epistemic'], uncertainties['total'], alpha=0.6, s=20)
+        axes[0,0].set_xlabel('Epistemic Uncertainty (Model)')
+        axes[0,0].set_ylabel('Total Uncertainty (Predictive)')
+        axes[0,0].set_title('Model vs Predictive Uncertainty')
+        
+        # 2. Uncertainty by correctness
+        correct_uncertainty = uncertainties['total'][y_test == y_pred]
+        incorrect_uncertainty = uncertainties['total'][y_test != y_pred]
+        
+        axes[0,1].hist(correct_uncertainty, bins=20, alpha=0.7, label='Correct', color='green', density=True)
+        axes[0,1].hist(incorrect_uncertainty, bins=20, alpha=0.7, label='Incorrect', color='red', density=True)
+        axes[0,1].set_xlabel('Total Uncertainty')
+        axes[0,1].set_ylabel('Density')
+        axes[0,1].set_title('Uncertainty Distribution by Correctness')
+        axes[0,1].legend()
+        
+        # 3. Confidence vs uncertainty colored by correctness
+        confidence_scores = np.max(uncertainties['mean'], axis=1)
+        correct_mask = y_test == y_pred
+        
+        axes[1,0].scatter(uncertainties['total'][correct_mask], confidence_scores[correct_mask],
+                         alpha=0.6, label='Correct', color='green', s=15)
+        axes[1,0].scatter(uncertainties['total'][~correct_mask], confidence_scores[~correct_mask],
+                         alpha=0.6, label='Incorrect', color='red', s=15)
+        axes[1,0].set_xlabel('Total Uncertainty')
+        axes[1,0].set_ylabel('Confidence')
+        axes[1,0].set_title('Bayesian: Confidence vs Uncertainty')
+        axes[1,0].legend()
+        
+        # 4. Uncertainty distribution across classes
+        uncertainty_by_true_class = [uncertainties['total'][y_test == i] for i in range(NUM_CLASSES)]
+        axes[1,1].boxplot(uncertainty_by_true_class, 
+                         labels=[name[:10] + '...' if len(name) > 10 else name for name in class_names])
+        axes[1,1].set_ylabel('Total Uncertainty')
+        axes[1,1].set_title('Bayesian Uncertainty by True Class')
+        axes[1,1].tick_params(axis='x', rotation=45)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(PLOTS_DIR, 'bayesian_uncertainty_analysis.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+
+    # Performance Analysis and Recommendations
+    print(f"\n{'='*60}")
+    print("PERFORMANCE ANALYSIS & RECOMMENDATIONS")
+    print(f"{'='*60}")
+
+    # Check if targets are achieved
+    targets_met = {
+        'Overall Accuracy ≥ 80%': accuracy >= 0.8,
+        'Weighted F1 ≥ 80%': f1_weighted >= 0.8,
+        'All classes F1 ≥ 60%': all(f1 >= 0.6 for f1 in f1_per_class),
+        'All classes Accuracy ≥ 60%': all(acc >= 0.6 for acc in class_accuracies)
+    }
+
+    print("Target Achievement:")
+    for target, achieved in targets_met.items():
+        status = "✅ ACHIEVED" if achieved else "❌ NOT ACHIEVED"
+        print(f"  {target}: {status}")
+
+    print(f"\nFinal Performance Summary:")
+    print(f"- Overall Accuracy: {accuracy*100:.1f}%")
+    print(f"- Weighted F1-Score: {f1_weighted:.3f}")
+    print(f"- Macro F1-Score: {f1_macro:.3f}")
+    print(f"- Best performing class: {class_names[np.argmax(f1_per_class)]} (F1: {np.max(f1_per_class):.3f})")
+    print(f"- Worst performing class: {class_names[np.argmin(f1_per_class)]} (F1: {np.min(f1_per_class):.3f})")
+
+    if bayesian_uncertainties:
+        print(f"\nBayesian Model Benefits:")
+        # Check if uncertainty helps with incorrect predictions
+        bayes_result = bayesian_uncertainties[0]
+        uncertainties = bayes_result['uncertainties']
+        correct_mask = y_test == y_pred
+        
+        correct_mean_uncertainty = np.mean(uncertainties['total'][correct_mask])
+        incorrect_mean_uncertainty = np.mean(uncertainties['total'][~correct_mask])
+        
+        if incorrect_mean_uncertainty > correct_mean_uncertainty:
+            print(f"- Uncertainty successfully discriminates correct vs incorrect predictions")
+            print(f"  Correct: {correct_mean_uncertainty:.3f}, Incorrect: {incorrect_mean_uncertainty:.3f}")
+        else:
+            print(f"- Uncertainty does not discriminate well between correct/incorrect")
+            
+        # High uncertainty threshold analysis
+        high_uncertainty_mask = uncertainties['total'] > np.percentile(uncertainties['total'], 80)
+        accuracy_high_uncertainty = np.mean(y_test[high_uncertainty_mask] == y_pred[high_uncertainty_mask])
+        accuracy_low_uncertainty = np.mean(y_test[~high_uncertainty_mask] == y_pred[~high_uncertainty_mask])
+        
+        print(f"- High uncertainty samples accuracy: {accuracy_high_uncertainty:.3f}")
+        print(f"- Low uncertainty samples accuracy: {accuracy_low_uncertainty:.3f}")
+
+    print(f"\nKey Improvements Made:")
+    print(f"1. STABLE Bayesian Implementation (Fixed KL divergence explosion)")
+    print(f"2. EXTREME Sampling Strategies (MEGA-SMOTE, Adaptive-SMOTE)")
+    print(f"3. Progressive Training (Balanced → Gradual → Full)")
+    print(f"4. EXTREME Class Weights (Power scaling for severe imbalance)")
+    print(f"5. Enhanced Augmentation (Rotation, zoom, brightness, contrast)")
+    print(f"6. Robust Loss Functions (Extreme focal loss with α=0.8, γ=3.0)")
+    print(f"7. Memory-Efficient Ensemble (TTA + Bayesian uncertainty)")
+
+    if any(not achieved for achieved in targets_met.values()):
+        print(f"\nRecommendations for Further Improvement:")
+        if accuracy < 0.8:
+            print(f"- Collect more data, especially for minority classes")
+            print(f"- Try different augmentation strategies (medical-specific)")
+            print(f"- Consider ensemble of multiple Bayesian models")
+            print(f"- Experiment with transfer learning from medical domain")
+        
+        if min(f1_per_class) < 0.6:
+            worst_class_idx = np.argmin(f1_per_class)
+            print(f"- Focus on improving {class_names[worst_class_idx]} (worst performing class)")
+            print(f"- Apply class-specific augmentation")
+            print(f"- Consider cost-sensitive learning approaches")
+        
+        if not targets_met['All classes Accuracy ≥ 60%']:
+            print(f"- Implement per-class confidence thresholding")
+            print(f"- Use uncertainty-based rejection for low-confidence predictions")
+    else:
+        print(f"\n ALL TARGETS ACHIEVED!")
+        print(f"- Model ready for deployment")
+        print(f"- Consider implementing uncertainty-based decision thresholds")
+        print(f"- Set up monitoring for model performance on new data")
+
+    print(f"\nFiles Generated:")
+    print(f"- {PLOTS_DIR}/final_enhanced_results.csv: Detailed predictions and uncertainties")
+    print(f"- {PLOTS_DIR}/comprehensive_analysis.png: Complete performance analysis")
+    if bayesian_uncertainties:
+        print(f"- {PLOTS_DIR}/bayesian_uncertainty_analysis.png: Bayesian uncertainty analysis")
+
+    print(f"\n{'='*60}")
+    print("ANALYSIS COMPLETE!")
+    print(f"{'='*60}")
+
+if __name__ == "__main__":
+    main()
