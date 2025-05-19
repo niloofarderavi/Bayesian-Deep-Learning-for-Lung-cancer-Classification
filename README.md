@@ -73,55 +73,6 @@ Key Achievements
 ✅ Successful handling of extreme class imbalance
 
 
-Installation
-bash# Clone the repository
-git clone https://github.com/yourusername/bayesian-lung-classification.git
-cd bayesian-lung-classification
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Download the dataset (requires Kaggle API)
-python download_dataset.py
-
-
-Usage
-Basic Training
-python# Run the complete training pipeline
-python main.py
-
-# Train only Bayesian model
-python train_bayesian.py --model bayesian --epochs 150
-Inference with Uncertainty
-pythonfrom models import BayesianLungClassifier
-
-model = BayesianLungClassifier.load('bayesian_best.h5')
-predictions, uncertainties = model.predict_with_uncertainty(ct_images)
-
-# Get epistemic and aleatoric uncertainties
-epistemic_uncertainty = uncertainties['epistemic']
-aleatoric_uncertainty = uncertainties['aleatoric']
-
-
-Project Structure
-bayesian-lung-classification/
-├── models/
-│   ├── bayesian_model.py      # Stable Bayesian architecture
-│   ├── standard_models.py     # DenseNet/ResNet implementations
-│   └── ensemble.py            # Ensemble framework
-├── data/
-│   ├── preprocessing.py       # Medical image preprocessing
-│   ├── augmentation.py        # CT-specific augmentations
-│   └── sampling.py            # Imbalance handling techniques
-├── training/
-│   ├── curriculum.py          # Progressive training strategy
-│   ├── losses.py              # Medical-specific loss functions
-│   └── metrics.py             # Clinical evaluation metrics
-├── evaluation/
-│   ├── uncertainty_analysis.py # Bayesian uncertainty evaluation
-│   └── clinical_metrics.py     # Medical performance assessment
-└── main.py                     # Complete training pipeline
-
 Key Technical Innovations
 Stable Bayesian Training
 
